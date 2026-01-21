@@ -3,9 +3,9 @@ ComfyUI latent morph frame renderer (API-driven).
 
 Timeline layout (5 phases)
 0) Pre   (STATIC_NUM):    static A (exact input bytes)
-1) Head  (TRANS_FRAMES):  blend=0.0, denoise ramps 0.0 -> DENOISE_FAC
+1) Head  (TRANS_FRAMES):  blend=0.0, denoise ramps   0.0 -> DENOISE_FAC (LINEAR)
 2) Mid   (MID_FRAMES):    blend sweeps 0.0 -> 1.0, denoise fixed at DENOISE_FAC
-3) Tail  (TRANS_FRAMES):  blend=1.0, denoise ramps DENOISE_FAC -> 0.0
+3) Tail  (TRANS_FRAMES):  blend=1.0, denoise ramps   DENOISE_FAC -> 0.0 (LINEAR)
 4) Post  (STATIC_NUM):    static B (exact input bytes)
 
 Naming
@@ -29,20 +29,28 @@ import requests
 COMFY_URL = "http://127.0.0.1:8188"
 WORKFLOW_PATH = "cursed1.json"
 
-OUT_PREFIX_BASE = "videos/static_num_test"
+OUT_PREFIX_BASE = "videos/smooth_lerp"
 COMFY_OUTPUT_DIR = os.path.expanduser("~/ComfyUI/output")
 ENDPOINT_DIR = os.path.join(COMFY_OUTPUT_DIR, OUT_PREFIX_BASE)
 
 WAIT_FOR_EACH = True
-SAVE_SUFFIX = "_00001"
+SAVE_SUFFIX = "_00001_"
 
 # Phase lengths
-STATIC_NUM = 60
+STATIC_NUM = 120
 TRANS_FRAMES = 60
 MID_FRAMES = 120
 
 # Denoise hyperparam
-DENOISE_FAC = 0.65
+DENOISE_FAC = 0.55
+
+
+# ---------------------------------------------------------------------
+# Timer helper
+# ---------------------------------------------------------------------
+def mmss(seconds: float) -> str:
+    seconds = int(seconds)
+    return f"{seconds // 60:02d}:{seconds % 60:02d}"
 
 
 # ---------------------------------------------------------------------
@@ -202,14 +210,15 @@ def submit_prompt(job: ApiPrompt) -> str:
     return resp.json()["prompt_id"]
 
 
+# ---------------------------------------------------------------------
+# Math helpers
+# ---------------------------------------------------------------------
+
 def lerp(a: float, b: float, t: float) -> float:
     return a + (b - a) * t
 
 
 def write_static_frames(img_bytes: bytes, start_idx: int, count: int) -> None:
-    """
-    Write `count` frames starting at global index `start_idx` as exact bytes.
-    """
     for i in range(count):
         frame_idx = start_idx + i
         path = os.path.join(ENDPOINT_DIR, f"frame_{frame_idx:05d}{SAVE_SUFFIX}.png")
@@ -231,7 +240,6 @@ def main() -> None:
     if not (0.0 <= DENOISE_FAC <= 1.0):
         raise ValueError("DENOISE_FAC must be in [0, 1].")
 
-    # Total = pre + head + mid + tail + post
     total_frames = 2 * STATIC_NUM + 2 * TRANS_FRAMES + MID_FRAMES
 
     prompt = load_as_api_prompt(WORKFLOW_PATH)
@@ -265,26 +273,18 @@ def main() -> None:
 
     os.makedirs(ENDPOINT_DIR, exist_ok=True)
 
-    # Fetch endpoint bytes once
+    t_start = time.time()
+
     a_bytes = download_input_image_bytes(file_a)
     b_bytes = download_input_image_bytes(file_b)
 
-    # ---------------------------------------------------------------
-    # Phase 0: Pre — STATIC_NUM frames of A (exact bytes)
-    # Frames: 0 .. STATIC_NUM-1
-    # ---------------------------------------------------------------
+    # Phase 0: Pre (static A)
     write_static_frames(a_bytes, start_idx=0, count=STATIC_NUM)
 
-    # ---------------------------------------------------------------
-    # Phase 1: Head — blend=0.0, denoise ramps 0.0 -> DENOISE_FAC
-    # Frames: STATIC_NUM .. STATIC_NUM + TRANS_FRAMES - 1
-    # If STATIC_NUM > 0, the first "A" is already present, but head frames are
-    # intentionally rendered (not copied) per your spec.
-    # ---------------------------------------------------------------
+    # Phase 1: Head — blend=0.0, denoise ramps 0.0 -> DENOISE_FAC (LINEAR)
     head_start = STATIC_NUM
     for i in range(TRANS_FRAMES):
         frame_idx = head_start + i
-
         if TRANS_FRAMES == 0:
             break
 
@@ -297,15 +297,13 @@ def main() -> None:
         set_save_prefix(job, save_id, f"{OUT_PREFIX_BASE}/frame_{frame_idx:05d}")
 
         prompt_id = submit_prompt(job)
-        print(f"[{frame_idx + 1:03d}/{total_frames}] head blend=0.0 denoise={denoise:.4f} prompt_id={prompt_id}")
+        elapsed = time.time() - t_start
+        print(f"[{frame_idx + 1:03d}/{total_frames}] head blend=0.0 denoise={denoise:.4f} prompt_id={prompt_id} (elapsed {mmss(elapsed)})")
 
         if WAIT_FOR_EACH:
             wait_for_prompt_done(prompt_id)
 
-    # ---------------------------------------------------------------
     # Phase 2: Mid — blend sweeps 0.0 -> 1.0, denoise fixed
-    # Frames: head_end .. head_end + MID_FRAMES - 1
-    # ---------------------------------------------------------------
     mid_start = STATIC_NUM + TRANS_FRAMES
     for j in range(MID_FRAMES):
         frame_idx = mid_start + j
@@ -317,15 +315,15 @@ def main() -> None:
         set_save_prefix(job, save_id, f"{OUT_PREFIX_BASE}/frame_{frame_idx:05d}")
 
         prompt_id = submit_prompt(job)
-        print(f"[{frame_idx + 1:03d}/{total_frames}] mid  blend={blend:.4f} denoise={DENOISE_FAC:.4f} prompt_id={prompt_id}")
+        elapsed = time.time() - t_start
+        print(
+            f"[{frame_idx + 1:03d}/{total_frames}] mid  blend={blend:.4f} denoise={DENOISE_FAC:.4f} prompt_id={prompt_id} (elapsed {mmss(elapsed)})"
+        )
 
         if WAIT_FOR_EACH:
             wait_for_prompt_done(prompt_id)
 
-    # ---------------------------------------------------------------
-    # Phase 3: Tail — blend=1.0, denoise ramps DENOISE_FAC -> 0.0
-    # Frames: mid_end .. mid_end + TRANS_FRAMES - 1
-    # ---------------------------------------------------------------
+    # Phase 3: Tail — blend=1.0, denoise ramps DENOISE_FAC -> 0.0 (LINEAR)
     tail_start = STATIC_NUM + TRANS_FRAMES + MID_FRAMES
     for i in range(TRANS_FRAMES):
         frame_idx = tail_start + i
@@ -339,17 +337,18 @@ def main() -> None:
         set_save_prefix(job, save_id, f"{OUT_PREFIX_BASE}/frame_{frame_idx:05d}")
 
         prompt_id = submit_prompt(job)
-        print(f"[{frame_idx + 1:03d}/{total_frames}] tail blend=1.0 denoise={denoise:.4f} prompt_id={prompt_id}")
+        elapsed = time.time() - t_start
+        print(f"[{frame_idx + 1:03d}/{total_frames}] tail blend=1.0 denoise={denoise:.4f} prompt_id={prompt_id} (elapsed {mmss(elapsed)})")
 
         if WAIT_FOR_EACH:
             wait_for_prompt_done(prompt_id)
 
-    # ---------------------------------------------------------------
-    # Phase 4: Post — STATIC_NUM frames of B (exact bytes)
-    # Frames: tail_end .. total_frames-1
-    # ---------------------------------------------------------------
+    # Phase 4: Post (static B)
     post_start = STATIC_NUM + TRANS_FRAMES + MID_FRAMES + TRANS_FRAMES
     write_static_frames(b_bytes, start_idx=post_start, count=STATIC_NUM)
+
+    total = time.time() - t_start
+    print(f"[TIME] total blend time {mmss(total)}")
 
     print("Done: all frames generated.")
 
