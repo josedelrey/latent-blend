@@ -1,0 +1,1 @@
+ffmpeg -framerate 30 -pattern_type glob -i 'frame_*_00001_.png'   -c:v libx264 -pix_fmt yuv420p output_30fps.mp4
