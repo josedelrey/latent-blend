@@ -31,7 +31,7 @@ COMFY_URL = "http://127.0.0.1:8188"
 WORKFLOW_PATH = "cursed1.json"
 
 # Output path relative to ComfyUI/output/
-OUT_PREFIX_BASE = "videos/morph_test_2"
+OUT_PREFIX_BASE = "videos/name_test_2"
 
 # Absolute output path (used only to write the two endpoint frames)
 COMFY_OUTPUT_DIR = os.path.expanduser("~/ComfyUI/output")
@@ -278,8 +278,11 @@ def main() -> None:
     a_bytes = download_input_image_bytes(file_a)
     b_bytes = download_input_image_bytes(file_b)
 
-    first_path = os.path.join(ENDPOINT_DIR, "frame_00000.png")
-    last_path = os.path.join(ENDPOINT_DIR, f"frame_{total_frames - 1:05d}.png")
+    first_path = os.path.join(ENDPOINT_DIR, "frame_00000_00001_.png")
+    last_path  = os.path.join(
+        ENDPOINT_DIR,
+        f"frame_{total_frames - 1:05d}_00001_.png"
+    )
 
     with open(first_path, "wb") as f:
         f.write(a_bytes)

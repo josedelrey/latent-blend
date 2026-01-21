@@ -12,7 +12,7 @@
     "inputs": {
       "lora_name": "cursedimageslora.safetensors",
       "strength_model": 0.96,
-      "strength_clip": 1.02,
+      "strength_clip": 0.96,
       "model": [
         "1",
         0
@@ -121,7 +121,7 @@
   },
   "21": {
     "inputs": {
-      "filename_prefix": "videos/1",
+      "filename_prefix": "",
       "images": [
         "12",
         0
@@ -139,7 +139,7 @@
       "cfg": 8,
       "sampler_name": "euler",
       "scheduler": "simple",
-      "denoise": 0.53,
+      "denoise": 0.75,
       "model": [
         "2",
         0
@@ -164,7 +164,7 @@
   },
   "29": {
     "inputs": {
-      "blend_factor": 0.5,
+      "blend_factor": 0,
       "samples1": [
         "6",
         0
