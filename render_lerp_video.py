@@ -1,5 +1,6 @@
 """
-ComfyUI latent morph frame renderer (API-driven), now batch-runs a whole numbered folder.
+ComfyUI latent morph frame renderer (API-driven), batch-runs a whole numbered folder,
+and can RESUME after Ctrl+C by skipping already-complete morph folders.
 
 It expects images in ComfyUI input (type=input), named:
   0001.png, 0002.png, ... up to 0050.png
@@ -13,6 +14,7 @@ Example:
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import time
@@ -28,7 +30,7 @@ COMFY_URL = "http://127.0.0.1:8188"
 WORKFLOW_PATH = "cursed1.json"
 
 # Root output prefix (hardcoded)
-OUT_PREFIX_BASE_ROOT = "videos/cursedmidjourney_lerp_high"
+OUT_PREFIX_BASE_ROOT = "videos/morphs"
 COMFY_OUTPUT_DIR = os.path.expanduser("~/ComfyUI/output")
 
 WAIT_FOR_EACH = True
@@ -49,11 +51,17 @@ KSAMPLER_CFG = 3.5
 LORA_STRENGTH_MODEL = 0.9
 LORA_STRENGTH_CLIP = 0.9
 
-# Numbered sequence config (NEW)
+# Numbered sequence config
 SEQ_FIRST = 1
 SEQ_LAST = 50
 SEQ_PAD = 4
 SEQ_EXT = ".png"
+
+# ---------------------------------------------------------------------
+# Resume behavior (NEW)
+# ---------------------------------------------------------------------
+# If a morph folder exists but is incomplete, wipe its frames and regenerate cleanly.
+CLEAR_PARTIAL_FOLDERS = True
 
 # ---------------------------------------------------------------------
 # Confirmed key names (from your discovery output)
@@ -86,6 +94,7 @@ def load_as_api_prompt(path: str) -> ApiPrompt:
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
+    # Already looks like API prompt: node_id -> {class_type, inputs}
     if isinstance(data, dict):
         node_like = {
             k: v
@@ -95,6 +104,7 @@ def load_as_api_prompt(path: str) -> ApiPrompt:
         if node_like:
             return node_like
 
+    # Graph-style export: {"nodes": [...]}
     if isinstance(data, dict) and isinstance(data.get("nodes"), list):
         prompt: ApiPrompt = {}
         for n in data["nodes"]:
@@ -108,8 +118,7 @@ def load_as_api_prompt(path: str) -> ApiPrompt:
             prompt[str(nid)] = {"class_type": class_type, "inputs": inputs}
 
         if prompt and any(
-            isinstance(v.get("inputs"), dict) and v["inputs"]
-            for v in prompt.values()
+            isinstance(v.get("inputs"), dict) and v["inputs"] for v in prompt.values()
         ):
             return prompt
 
@@ -124,7 +133,6 @@ def load_as_api_prompt(path: str) -> ApiPrompt:
 # ---------------------------------------------------------------------
 # Node resolution by class_type + required keys
 # ---------------------------------------------------------------------
-
 def _ct(node: Dict[str, Any]) -> str:
     return (node.get("class_type") or "").lower()
 
@@ -151,7 +159,10 @@ def find_single_node(
 
         if class_type_contains is not None and class_type_contains not in ct:
             continue
-        if forbidden_class_type_contains is not None and forbidden_class_type_contains in ct:
+        if (
+            forbidden_class_type_contains is not None
+            and forbidden_class_type_contains in ct
+        ):
             continue
         if any(k not in ins for k in required_input_keys):
             continue
@@ -174,7 +185,9 @@ def find_single_node(
             node = prompt[nid]
             ins = _inputs(node)
             print(f"  {nid}: {node.get('class_type')} -> {sorted(list(ins.keys()))}")
-        raise RuntimeError(f"Could not resolve {label} (ambiguous: {len(matches)} matches).")
+        raise RuntimeError(
+            f"Could not resolve {label} (ambiguous: {len(matches)} matches)."
+        )
 
     return matches[0]
 
@@ -188,7 +201,10 @@ def find_two_loadimage_nodes(prompt: ApiPrompt) -> Tuple[str, str]:
             matches.append(nid)
 
     if len(matches) != 2:
-        print(f"[ERROR] Expected exactly 2 LoadImage nodes with key '{LOAD_IMAGE_KEY}', found {len(matches)}: {matches}")
+        print(
+            f"[ERROR] Expected exactly 2 LoadImage nodes with key '{LOAD_IMAGE_KEY}', "
+            f"found {len(matches)}: {matches}"
+        )
         for nid in matches:
             node = prompt[nid]
             print(f"  {nid}: {node.get('class_type')} -> {sorted(list(_inputs(node).keys()))}")
@@ -240,7 +256,6 @@ def resolve_graph_ids(prompt: ApiPrompt) -> Tuple[str, str, str, str, str, str]:
 # ---------------------------------------------------------------------
 # Direct setters (fixed key names)
 # ---------------------------------------------------------------------
-
 def require_node(prompt: ApiPrompt, node_id: str) -> Dict[str, Any]:
     if node_id not in prompt:
         raise KeyError(f"Node id {node_id} not found in prompt.")
@@ -278,7 +293,9 @@ def set_ksampler_cfg(prompt: ApiPrompt, ksampler_node_id: str, cfg: float) -> No
     node["inputs"][CFG_KEY] = float(cfg)
 
 
-def set_lora_strengths(prompt: ApiPrompt, lora_node_id: str, strength_model: float, strength_clip: float) -> None:
+def set_lora_strengths(
+    prompt: ApiPrompt, lora_node_id: str, strength_model: float, strength_clip: float
+) -> None:
     node = require_node(prompt, lora_node_id)
     node["inputs"][LORA_MODEL_KEY] = float(strength_model)
     node["inputs"][LORA_CLIP_KEY] = float(strength_clip)
@@ -287,7 +304,6 @@ def set_lora_strengths(prompt: ApiPrompt, lora_node_id: str, strength_model: flo
 # ---------------------------------------------------------------------
 # Endpoint image resolution via ComfyUI API
 # ---------------------------------------------------------------------
-
 def download_input_image_bytes(filename: str) -> bytes:
     r = requests.get(
         f"{COMFY_URL}/view",
@@ -301,7 +317,6 @@ def download_input_image_bytes(filename: str) -> bytes:
 # ---------------------------------------------------------------------
 # ComfyUI API helpers
 # ---------------------------------------------------------------------
-
 def wait_for_prompt_done(prompt_id: str, poll_s: float = 0.5) -> Dict[str, Any]:
     while True:
         r = requests.get(f"{COMFY_URL}/history/{prompt_id}", timeout=30)
@@ -321,7 +336,6 @@ def submit_prompt(job: ApiPrompt) -> str:
 # ---------------------------------------------------------------------
 # Math helpers
 # ---------------------------------------------------------------------
-
 def lerp(a: float, b: float, t: float) -> float:
     return a + (b - a) * t
 
@@ -339,9 +353,53 @@ def seq_filename(i: int) -> str:
 
 
 # ---------------------------------------------------------------------
+# Resume helpers (NEW)
+# ---------------------------------------------------------------------
+def total_frames_per_morph() -> int:
+    return 2 * STATIC_NUM + 2 * TRANS_FRAMES + MID_FRAMES
+
+
+def endpoint_dir_for_subfolder(out_subfolder: str) -> str:
+    out_prefix_base = f"{OUT_PREFIX_BASE_ROOT}/{out_subfolder}"
+    return os.path.join(COMFY_OUTPUT_DIR, out_prefix_base)
+
+
+def morph_is_complete(out_subfolder: str) -> bool:
+    """
+    A morph is considered complete if, for every expected frame index,
+    at least one file exists matching: frame_{idx:05d}*{SAVE_SUFFIX}.png
+    """
+    d = endpoint_dir_for_subfolder(out_subfolder)
+    if not os.path.isdir(d):
+        return False
+
+    total = total_frames_per_morph()
+    for idx in range(total):
+        pat = os.path.join(d, f"frame_{idx:05d}*{SAVE_SUFFIX}.png")
+        if not glob.glob(pat):
+            return False
+    return True
+
+
+def clear_partial_morph(out_subfolder: str) -> None:
+    """
+    Remove all produced frames in this morph folder (so rerender is clean).
+    Only deletes files matching frame_*{SAVE_SUFFIX}.png
+    """
+    d = endpoint_dir_for_subfolder(out_subfolder)
+    if not os.path.isdir(d):
+        return
+
+    for p in glob.glob(os.path.join(d, f"frame_*{SAVE_SUFFIX}.png")):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------
 # One morph job: A -> B into a subfolder
 # ---------------------------------------------------------------------
-
 def run_morph(
     *,
     base_prompt: ApiPrompt,
@@ -362,8 +420,7 @@ def run_morph(
     set_load_image_filename(prompt, load_a_id, a_filename)
     set_load_image_filename(prompt, load_b_id, b_filename)
 
-    total_frames = 2 * STATIC_NUM + 2 * TRANS_FRAMES + MID_FRAMES
-
+    total_frames = total_frames_per_morph()
     t_start = time.time()
 
     a_bytes = download_input_image_bytes(a_filename)
@@ -374,29 +431,28 @@ def run_morph(
 
     # Phase 1: Head — blend=0.0, denoise ramps 0.0 -> DENOISE_FAC (LINEAR)
     head_start = STATIC_NUM
-    for i in range(TRANS_FRAMES):
-        frame_idx = head_start + i
-        if TRANS_FRAMES == 0:
-            break
+    if TRANS_FRAMES != 0:
+        for i in range(TRANS_FRAMES):
+            frame_idx = head_start + i
 
-        u = 0.0 if TRANS_FRAMES == 1 else (i / (TRANS_FRAMES - 1))
-        denoise = lerp(0.0, DENOISE_FAC, u)
+            u = 0.0 if TRANS_FRAMES == 1 else (i / (TRANS_FRAMES - 1))
+            denoise = lerp(0.0, DENOISE_FAC, u)
 
-        job: ApiPrompt = json.loads(json.dumps(prompt))
-        set_blend_factor(job, blend_id, 0.0)
-        set_ksampler_denoise(job, ksampler_id, denoise)
-        set_ksampler_cfg(job, ksampler_id, KSAMPLER_CFG)
-        set_save_prefix(job, save_id, f"{out_prefix_base}/frame_{frame_idx:05d}")
+            job: ApiPrompt = json.loads(json.dumps(prompt))
+            set_blend_factor(job, blend_id, 0.0)
+            set_ksampler_denoise(job, ksampler_id, denoise)
+            set_ksampler_cfg(job, ksampler_id, KSAMPLER_CFG)
+            set_save_prefix(job, save_id, f"{out_prefix_base}/frame_{frame_idx:05d}")
 
-        prompt_id = submit_prompt(job)
-        elapsed = time.time() - t_start
-        print(
-            f"[{out_subfolder}] [{frame_idx + 1:03d}/{total_frames}] head blend=0.0 denoise={denoise:.4f} "
-            f"prompt_id={prompt_id} (elapsed {mmss(elapsed)})"
-        )
+            prompt_id = submit_prompt(job)
+            elapsed = time.time() - t_start
+            print(
+                f"[{out_subfolder}] [{frame_idx + 1:03d}/{total_frames}] head blend=0.0 denoise={denoise:.4f} "
+                f"prompt_id={prompt_id} (elapsed {mmss(elapsed)})"
+            )
 
-        if WAIT_FOR_EACH:
-            wait_for_prompt_done(prompt_id)
+            if WAIT_FOR_EACH:
+                wait_for_prompt_done(prompt_id)
 
     # Phase 2: Mid — blend sweeps 0.0 -> 1.0, denoise fixed
     mid_start = STATIC_NUM + TRANS_FRAMES
@@ -422,27 +478,28 @@ def run_morph(
 
     # Phase 3: Tail — blend=1.0, denoise ramps DENOISE_FAC -> 0.0 (LINEAR)
     tail_start = STATIC_NUM + TRANS_FRAMES + MID_FRAMES
-    for i in range(TRANS_FRAMES):
-        frame_idx = tail_start + i
+    if TRANS_FRAMES != 0:
+        for i in range(TRANS_FRAMES):
+            frame_idx = tail_start + i
 
-        u = 0.0 if TRANS_FRAMES == 1 else (i / (TRANS_FRAMES - 1))
-        denoise = lerp(DENOISE_FAC, 0.0, u)
+            u = 0.0 if TRANS_FRAMES == 1 else (i / (TRANS_FRAMES - 1))
+            denoise = lerp(DENOISE_FAC, 0.0, u)
 
-        job: ApiPrompt = json.loads(json.dumps(prompt))
-        set_blend_factor(job, blend_id, 1.0)
-        set_ksampler_denoise(job, ksampler_id, denoise)
-        set_ksampler_cfg(job, ksampler_id, KSAMPLER_CFG)
-        set_save_prefix(job, save_id, f"{out_prefix_base}/frame_{frame_idx:05d}")
+            job: ApiPrompt = json.loads(json.dumps(prompt))
+            set_blend_factor(job, blend_id, 1.0)
+            set_ksampler_denoise(job, ksampler_id, denoise)
+            set_ksampler_cfg(job, ksampler_id, KSAMPLER_CFG)
+            set_save_prefix(job, save_id, f"{out_prefix_base}/frame_{frame_idx:05d}")
 
-        prompt_id = submit_prompt(job)
-        elapsed = time.time() - t_start
-        print(
-            f"[{out_subfolder}] [{frame_idx + 1:03d}/{total_frames}] tail blend=1.0 denoise={denoise:.4f} "
-            f"prompt_id={prompt_id} (elapsed {mmss(elapsed)})"
-        )
+            prompt_id = submit_prompt(job)
+            elapsed = time.time() - t_start
+            print(
+                f"[{out_subfolder}] [{frame_idx + 1:03d}/{total_frames}] tail blend=1.0 denoise={denoise:.4f} "
+                f"prompt_id={prompt_id} (elapsed {mmss(elapsed)})"
+            )
 
-        if WAIT_FOR_EACH:
-            wait_for_prompt_done(prompt_id)
+            if WAIT_FOR_EACH:
+                wait_for_prompt_done(prompt_id)
 
     # Phase 4: Post (static B)
     post_start = STATIC_NUM + TRANS_FRAMES + MID_FRAMES + TRANS_FRAMES
@@ -454,9 +511,8 @@ def run_morph(
 
 
 # ---------------------------------------------------------------------
-# Main: build sequence and run all adjacent morphs
+# Main: build sequence and run all adjacent morphs (resume-friendly)
 # ---------------------------------------------------------------------
-
 def main() -> None:
     if STATIC_NUM < 0 or TRANS_FRAMES < 0 or MID_FRAMES < 0:
         raise ValueError("STATIC_NUM, TRANS_FRAMES and MID_FRAMES must be >= 0.")
@@ -477,7 +533,7 @@ def main() -> None:
     # Set LoRA strengths once in the base prompt (inherited by all morphs)
     set_lora_strengths(base_prompt, lora_id, LORA_STRENGTH_MODEL, LORA_STRENGTH_CLIP)
 
-    total_frames_per_morph = 2 * STATIC_NUM + 2 * TRANS_FRAMES + MID_FRAMES
+    total_frames = total_frames_per_morph()
     total_morphs = (SEQ_LAST - SEQ_FIRST)
 
     print("[RESOLVED IDS]")
@@ -489,7 +545,7 @@ def main() -> None:
     print(f"  Blend:       {blend_id} (key: {BLEND_KEY})")
     print(
         f"Per-morph timeline: pre={STATIC_NUM}, head={TRANS_FRAMES}, mid={MID_FRAMES}, tail={TRANS_FRAMES}, post={STATIC_NUM}, "
-        f"frames={total_frames_per_morph} | DENOISE_FAC={DENOISE_FAC} | CFG={KSAMPLER_CFG} | "
+        f"frames={total_frames} | DENOISE_FAC={DENOISE_FAC} | CFG={KSAMPLER_CFG} | "
         f"LoRA(model={LORA_STRENGTH_MODEL}, clip={LORA_STRENGTH_CLIP})"
     )
     print(
@@ -497,24 +553,36 @@ def main() -> None:
         f"({total_morphs} morphs). Output root: {os.path.join(COMFY_OUTPUT_DIR, OUT_PREFIX_BASE_ROOT)}\n"
     )
 
-    # Run adjacent morphs
     big_start = time.time()
-    for i in range(SEQ_FIRST, SEQ_LAST):
-        a = seq_filename(i)
-        b = seq_filename(i + 1)
-        out_subfolder = f"{i:0{SEQ_PAD}d}_to_{i+1:0{SEQ_PAD}d}"
+    try:
+        for i in range(SEQ_FIRST, SEQ_LAST):
+            a = seq_filename(i)
+            b = seq_filename(i + 1)
+            out_subfolder = f"{i:0{SEQ_PAD}d}_to_{i+1:0{SEQ_PAD}d}"
 
-        print(f"[MORPH {i-SEQ_FIRST+1:02d}/{total_morphs:02d}] {a} -> {b}  =>  {out_subfolder}")
-        run_morph(
-            base_prompt=base_prompt,
-            ids=ids,
-            a_filename=a,
-            b_filename=b,
-            out_subfolder=out_subfolder,
-        )
+            if morph_is_complete(out_subfolder):
+                print(f"[SKIP] {out_subfolder} already complete.")
+                continue
 
-    big_total = time.time() - big_start
-    print(f"[ALL DONE] Total time for {total_morphs} morphs: {mmss(big_total)}")
+            morph_dir = endpoint_dir_for_subfolder(out_subfolder)
+            if os.path.isdir(morph_dir) and CLEAR_PARTIAL_FOLDERS:
+                print(f"[RESUME] {out_subfolder} exists but incomplete. Clearing partial frames...")
+                clear_partial_morph(out_subfolder)
+
+            print(f"[MORPH {i-SEQ_FIRST+1:02d}/{total_morphs:02d}] {a} -> {b}  =>  {out_subfolder}")
+            run_morph(
+                base_prompt=base_prompt,
+                ids=ids,
+                a_filename=a,
+                b_filename=b,
+                out_subfolder=out_subfolder,
+            )
+
+    except KeyboardInterrupt:
+        print("\n[INTERRUPTED] Ctrl+C received. Re-run to continue; completed folders will be skipped.")
+    finally:
+        big_total = time.time() - big_start
+        print(f"[STOP] Elapsed time this run: {mmss(big_total)}")
 
 
 if __name__ == "__main__":
