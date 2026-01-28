@@ -1,16 +1,14 @@
 """
-ComfyUI latent morph frame renderer (API-driven).
+ComfyUI latent morph frame renderer (API-driven), now batch-runs a whole numbered folder.
 
-Timeline layout (5 phases)
-0) Pre   (STATIC_NUM):    static A (exact input bytes)
-1) Head  (TRANS_FRAMES):  blend=0.0, denoise ramps   0.0 -> DENOISE_FAC (LINEAR)
-2) Mid   (MID_FRAMES):    blend sweeps 0.0 -> 1.0, denoise fixed at DENOISE_FAC
-3) Tail  (TRANS_FRAMES):  blend=1.0, denoise ramps   DENOISE_FAC -> 0.0 (LINEAR)
-4) Post  (STATIC_NUM):    static B (exact input bytes)
+It expects images in ComfyUI input (type=input), named:
+  0001.png, 0002.png, ... up to 0050.png
 
-Naming
-- Frames are numbered globally: frame_00000{SAVE_SUFFIX}.png ... frame_<TOTAL-1>{SAVE_SUFFIX}.png
-- Pre/Post frames are written as exact bytes (no ComfyUI render).
+It generates subfolders under:
+  ~/ComfyUI/output/<OUT_PREFIX_BASE_ROOT>/<PAIR_SUBFOLDER>/
+
+Example:
+  videos/cursedmidjourney_lerp_high/0001_to_0002/frame_00000{SAVE_SUFFIX}.png
 """
 
 from __future__ import annotations
@@ -23,15 +21,15 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 # ---------------------------------------------------------------------
-# User config
+# User config (UNCHANGED hyperparams)
 # ---------------------------------------------------------------------
 
 COMFY_URL = "http://127.0.0.1:8188"
 WORKFLOW_PATH = "cursed1.json"
 
-OUT_PREFIX_BASE = "videos/cursedmidjourney_lerp_high"
+# Root output prefix (hardcoded)
+OUT_PREFIX_BASE_ROOT = "videos/cursedmidjourney_lerp_high"
 COMFY_OUTPUT_DIR = os.path.expanduser("~/ComfyUI/output")
-ENDPOINT_DIR = os.path.join(COMFY_OUTPUT_DIR, OUT_PREFIX_BASE)
 
 WAIT_FOR_EACH = True
 SAVE_SUFFIX = "_00001_"
@@ -51,9 +49,11 @@ KSAMPLER_CFG = 3.5
 LORA_STRENGTH_MODEL = 0.9
 LORA_STRENGTH_CLIP = 0.9
 
-# Pick filenames that exist under ~/ComfyUI/input/
-INPUT_A_FILENAME = "37.png"
-INPUT_B_FILENAME = "7.png"
+# Numbered sequence config (NEW)
+SEQ_FIRST = 1
+SEQ_LAST = 50
+SEQ_PAD = 4
+SEQ_EXT = ".png"
 
 # ---------------------------------------------------------------------
 # Confirmed key names (from your discovery output)
@@ -66,6 +66,7 @@ DENOISE_KEY = "denoise"
 CFG_KEY = "cfg"
 LORA_MODEL_KEY = "strength_model"
 LORA_CLIP_KEY = "strength_clip"
+
 
 # ---------------------------------------------------------------------
 # Timer helper
@@ -158,7 +159,6 @@ def find_single_node(
         matches.append(nid)
 
     if not matches:
-        # Print a compact inventory for debugging.
         print(f"[ERROR] Could not resolve {label}. Criteria:")
         print(f"  class_type_contains={class_type_contains!r}")
         print(f"  required_input_keys={required_input_keys}")
@@ -180,7 +180,6 @@ def find_single_node(
 
 
 def find_two_loadimage_nodes(prompt: ApiPrompt) -> Tuple[str, str]:
-    # We want exactly two LoadImage nodes that accept the 'image' key.
     matches: List[str] = []
     for nid, node in prompt.items():
         ct = _ct(node)
@@ -327,62 +326,51 @@ def lerp(a: float, b: float, t: float) -> float:
     return a + (b - a) * t
 
 
-def write_static_frames(img_bytes: bytes, start_idx: int, count: int) -> None:
+def write_static_frames(img_bytes: bytes, endpoint_dir: str, start_idx: int, count: int) -> None:
     for i in range(count):
         frame_idx = start_idx + i
-        path = os.path.join(ENDPOINT_DIR, f"frame_{frame_idx:05d}{SAVE_SUFFIX}.png")
+        path = os.path.join(endpoint_dir, f"frame_{frame_idx:05d}{SAVE_SUFFIX}.png")
         with open(path, "wb") as f:
             f.write(img_bytes)
 
 
+def seq_filename(i: int) -> str:
+    return f"{i:0{SEQ_PAD}d}{SEQ_EXT}"
+
+
 # ---------------------------------------------------------------------
-# Main
+# One morph job: A -> B into a subfolder
 # ---------------------------------------------------------------------
 
-def main() -> None:
-    if STATIC_NUM < 0 or TRANS_FRAMES < 0 or MID_FRAMES < 0:
-        raise ValueError("STATIC_NUM, TRANS_FRAMES and MID_FRAMES must be >= 0.")
-    if MID_FRAMES < 2:
-        raise ValueError("MID_FRAMES must be >= 2 to sweep blend factor 0->1.")
-    if TRANS_FRAMES == 1:
-        raise ValueError("TRANS_FRAMES must be 0 or >= 2 for a denoise ramp.")
-    if not (0.0 <= DENOISE_FAC <= 1.0):
-        raise ValueError("DENOISE_FAC must be in [0, 1].")
+def run_morph(
+    *,
+    base_prompt: ApiPrompt,
+    ids: Tuple[str, str, str, str, str, str],
+    a_filename: str,
+    b_filename: str,
+    out_subfolder: str,
+) -> None:
+    lora_id, load_a_id, load_b_id, ksampler_id, save_id, blend_id = ids
+
+    # This job's output paths
+    out_prefix_base = f"{OUT_PREFIX_BASE_ROOT}/{out_subfolder}"
+    endpoint_dir = os.path.join(COMFY_OUTPUT_DIR, out_prefix_base)
+    os.makedirs(endpoint_dir, exist_ok=True)
+
+    # Clone the base prompt and set endpoints for this morph
+    prompt: ApiPrompt = json.loads(json.dumps(base_prompt))
+    set_load_image_filename(prompt, load_a_id, a_filename)
+    set_load_image_filename(prompt, load_b_id, b_filename)
 
     total_frames = 2 * STATIC_NUM + 2 * TRANS_FRAMES + MID_FRAMES
-    prompt = load_as_api_prompt(WORKFLOW_PATH)
-
-    lora_id, load_a_id, load_b_id, ksampler_id, save_id, blend_id = resolve_graph_ids(prompt)
-
-    # Override the workflow endpoints
-    set_load_image_filename(prompt, load_a_id, INPUT_A_FILENAME)
-    set_load_image_filename(prompt, load_b_id, INPUT_B_FILENAME)
-
-    # Set LoRA strengths once on base prompt (inherited by per-frame clones)
-    set_lora_strengths(prompt, lora_id, LORA_STRENGTH_MODEL, LORA_STRENGTH_CLIP)
-
-    print("[RESOLVED IDS]")
-    print(f"  LoRA loader: {lora_id} (expects keys: {LORA_MODEL_KEY}, {LORA_CLIP_KEY})")
-    print(f"  LoadImage A: {load_a_id} (key: {LOAD_IMAGE_KEY})")
-    print(f"  LoadImage B: {load_b_id} (key: {LOAD_IMAGE_KEY})")
-    print(f"  KSampler:    {ksampler_id} (keys: {DENOISE_KEY}, {CFG_KEY})")
-    print(f"  SaveImage:   {save_id} (key: {SAVE_PREFIX_KEY})")
-    print(f"  Blend:       {blend_id} (key: {BLEND_KEY})")
-    print(
-        f"Timeline: pre={STATIC_NUM}, head={TRANS_FRAMES}, mid={MID_FRAMES}, tail={TRANS_FRAMES}, post={STATIC_NUM}, "
-        f"total={total_frames} | DENOISE_FAC={DENOISE_FAC} | CFG={KSAMPLER_CFG} | "
-        f"LoRA(model={LORA_STRENGTH_MODEL}, clip={LORA_STRENGTH_CLIP})"
-    )
-
-    os.makedirs(ENDPOINT_DIR, exist_ok=True)
 
     t_start = time.time()
 
-    a_bytes = download_input_image_bytes(INPUT_A_FILENAME)
-    b_bytes = download_input_image_bytes(INPUT_B_FILENAME)
+    a_bytes = download_input_image_bytes(a_filename)
+    b_bytes = download_input_image_bytes(b_filename)
 
     # Phase 0: Pre (static A)
-    write_static_frames(a_bytes, start_idx=0, count=STATIC_NUM)
+    write_static_frames(a_bytes, endpoint_dir, start_idx=0, count=STATIC_NUM)
 
     # Phase 1: Head — blend=0.0, denoise ramps 0.0 -> DENOISE_FAC (LINEAR)
     head_start = STATIC_NUM
@@ -398,12 +386,12 @@ def main() -> None:
         set_blend_factor(job, blend_id, 0.0)
         set_ksampler_denoise(job, ksampler_id, denoise)
         set_ksampler_cfg(job, ksampler_id, KSAMPLER_CFG)
-        set_save_prefix(job, save_id, f"{OUT_PREFIX_BASE}/frame_{frame_idx:05d}")
+        set_save_prefix(job, save_id, f"{out_prefix_base}/frame_{frame_idx:05d}")
 
         prompt_id = submit_prompt(job)
         elapsed = time.time() - t_start
         print(
-            f"[{frame_idx + 1:03d}/{total_frames}] head blend=0.0 denoise={denoise:.4f} "
+            f"[{out_subfolder}] [{frame_idx + 1:03d}/{total_frames}] head blend=0.0 denoise={denoise:.4f} "
             f"prompt_id={prompt_id} (elapsed {mmss(elapsed)})"
         )
 
@@ -420,12 +408,12 @@ def main() -> None:
         set_blend_factor(job, blend_id, blend)
         set_ksampler_denoise(job, ksampler_id, DENOISE_FAC)
         set_ksampler_cfg(job, ksampler_id, KSAMPLER_CFG)
-        set_save_prefix(job, save_id, f"{OUT_PREFIX_BASE}/frame_{frame_idx:05d}")
+        set_save_prefix(job, save_id, f"{out_prefix_base}/frame_{frame_idx:05d}")
 
         prompt_id = submit_prompt(job)
         elapsed = time.time() - t_start
         print(
-            f"[{frame_idx + 1:03d}/{total_frames}] mid  blend={blend:.4f} denoise={DENOISE_FAC:.4f} "
+            f"[{out_subfolder}] [{frame_idx + 1:03d}/{total_frames}] mid  blend={blend:.4f} denoise={DENOISE_FAC:.4f} "
             f"prompt_id={prompt_id} (elapsed {mmss(elapsed)})"
         )
 
@@ -444,12 +432,12 @@ def main() -> None:
         set_blend_factor(job, blend_id, 1.0)
         set_ksampler_denoise(job, ksampler_id, denoise)
         set_ksampler_cfg(job, ksampler_id, KSAMPLER_CFG)
-        set_save_prefix(job, save_id, f"{OUT_PREFIX_BASE}/frame_{frame_idx:05d}")
+        set_save_prefix(job, save_id, f"{out_prefix_base}/frame_{frame_idx:05d}")
 
         prompt_id = submit_prompt(job)
         elapsed = time.time() - t_start
         print(
-            f"[{frame_idx + 1:03d}/{total_frames}] tail blend=1.0 denoise={denoise:.4f} "
+            f"[{out_subfolder}] [{frame_idx + 1:03d}/{total_frames}] tail blend=1.0 denoise={denoise:.4f} "
             f"prompt_id={prompt_id} (elapsed {mmss(elapsed)})"
         )
 
@@ -458,11 +446,75 @@ def main() -> None:
 
     # Phase 4: Post (static B)
     post_start = STATIC_NUM + TRANS_FRAMES + MID_FRAMES + TRANS_FRAMES
-    write_static_frames(b_bytes, start_idx=post_start, count=STATIC_NUM)
+    write_static_frames(b_bytes, endpoint_dir, start_idx=post_start, count=STATIC_NUM)
 
     total = time.time() - t_start
-    print(f"[TIME] total blend time {mmss(total)}")
-    print("Done: all frames generated.")
+    print(f"[{out_subfolder}] [TIME] total blend time {mmss(total)}")
+    print(f"[{out_subfolder}] Done: all frames generated.\n")
+
+
+# ---------------------------------------------------------------------
+# Main: build sequence and run all adjacent morphs
+# ---------------------------------------------------------------------
+
+def main() -> None:
+    if STATIC_NUM < 0 or TRANS_FRAMES < 0 or MID_FRAMES < 0:
+        raise ValueError("STATIC_NUM, TRANS_FRAMES and MID_FRAMES must be >= 0.")
+    if MID_FRAMES < 2:
+        raise ValueError("MID_FRAMES must be >= 2 to sweep blend factor 0->1.")
+    if TRANS_FRAMES == 1:
+        raise ValueError("TRANS_FRAMES must be 0 or >= 2 for a denoise ramp.")
+    if not (0.0 <= DENOISE_FAC <= 1.0):
+        raise ValueError("DENOISE_FAC must be in [0, 1].")
+    if SEQ_LAST <= SEQ_FIRST:
+        raise ValueError("SEQ_LAST must be > SEQ_FIRST.")
+
+    # Load workflow once, resolve ids once
+    base_prompt = load_as_api_prompt(WORKFLOW_PATH)
+    ids = resolve_graph_ids(base_prompt)
+    lora_id, load_a_id, load_b_id, ksampler_id, save_id, blend_id = ids
+
+    # Set LoRA strengths once in the base prompt (inherited by all morphs)
+    set_lora_strengths(base_prompt, lora_id, LORA_STRENGTH_MODEL, LORA_STRENGTH_CLIP)
+
+    total_frames_per_morph = 2 * STATIC_NUM + 2 * TRANS_FRAMES + MID_FRAMES
+    total_morphs = (SEQ_LAST - SEQ_FIRST)
+
+    print("[RESOLVED IDS]")
+    print(f"  LoRA loader: {lora_id} (expects keys: {LORA_MODEL_KEY}, {LORA_CLIP_KEY})")
+    print(f"  LoadImage A: {load_a_id} (key: {LOAD_IMAGE_KEY})")
+    print(f"  LoadImage B: {load_b_id} (key: {LOAD_IMAGE_KEY})")
+    print(f"  KSampler:    {ksampler_id} (keys: {DENOISE_KEY}, {CFG_KEY})")
+    print(f"  SaveImage:   {save_id} (key: {SAVE_PREFIX_KEY})")
+    print(f"  Blend:       {blend_id} (key: {BLEND_KEY})")
+    print(
+        f"Per-morph timeline: pre={STATIC_NUM}, head={TRANS_FRAMES}, mid={MID_FRAMES}, tail={TRANS_FRAMES}, post={STATIC_NUM}, "
+        f"frames={total_frames_per_morph} | DENOISE_FAC={DENOISE_FAC} | CFG={KSAMPLER_CFG} | "
+        f"LoRA(model={LORA_STRENGTH_MODEL}, clip={LORA_STRENGTH_CLIP})"
+    )
+    print(
+        f"Sequence: {seq_filename(SEQ_FIRST)} -> {seq_filename(SEQ_LAST)} "
+        f"({total_morphs} morphs). Output root: {os.path.join(COMFY_OUTPUT_DIR, OUT_PREFIX_BASE_ROOT)}\n"
+    )
+
+    # Run adjacent morphs
+    big_start = time.time()
+    for i in range(SEQ_FIRST, SEQ_LAST):
+        a = seq_filename(i)
+        b = seq_filename(i + 1)
+        out_subfolder = f"{i:0{SEQ_PAD}d}_to_{i+1:0{SEQ_PAD}d}"
+
+        print(f"[MORPH {i-SEQ_FIRST+1:02d}/{total_morphs:02d}] {a} -> {b}  =>  {out_subfolder}")
+        run_morph(
+            base_prompt=base_prompt,
+            ids=ids,
+            a_filename=a,
+            b_filename=b,
+            out_subfolder=out_subfolder,
+        )
+
+    big_total = time.time() - big_start
+    print(f"[ALL DONE] Total time for {total_morphs} morphs: {mmss(big_total)}")
 
 
 if __name__ == "__main__":
